@@ -1,6 +1,9 @@
 from __future__ import absolute_import
-import GcpDataCatalog   # Add GoogleDataCatalogLib folder to Preferences Project Structure
-import argparse
+from google.cloud import datacatalog_v1, storage
+from RenewalyticsDataCatalogLib import *
+from RenewalyticsDataflowMetadataLib import *
+import sys, argparse
+from datetime import datetime
 import logging
 import json
 import apache_beam as beam
@@ -14,12 +17,14 @@ g_schema = {
         'name': 'NAMN', 'type': 'STRING', 'mode': 'REQUIRED'
     }]
 }
+project_name = 'RawImportSweGridAreasGeo'
 
 
-class custom_json_parser(beam.DoFn):
+class DataIngestion(beam.DoFn):
     def process(self, element):
         l_new = []
         for x in element["features"]:
+            logging.info('DataIngestion.process: properties={}'.format(x['properties']))
             properties = x['properties']
             geo = {
                 'geometry': str(x['geometry'])
@@ -30,7 +35,7 @@ class custom_json_parser(beam.DoFn):
 
 
 def run(argv=None, save_main_session=True):
-    logging.info("Starting RawImportSweGridAreasGeo")
+    logging.info("Starting {}".format(project_name))
     logging.info('argv={}'.format(argv))
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -47,6 +52,12 @@ def run(argv=None, save_main_session=True):
     logging.info('known_args: {}'.format(known_args))
     logging.info('pipeline_args: {}'.format(pipeline_args))
 
+    bucket = known_args.input.split('/')[2]  # 'prod-bucket.renewalytics.io'
+    blob = known_args.input[-len(known_args.input) + len('gs://') + len(bucket) +1:]
+    metadata = {**{'code_module': project_name, 'input': known_args.input,
+                   'output': known_args.output, 'updated': datetime.now()},
+                **convert_storage_metadata_to_catalog(get_storage_metadata(storage.Client(), bucket, blob))}
+
     # We use the save_main_session option because one or more DoFn's in this
     # workflow rely on global context (e.g., a module imported at module level).
     pipeline_options = PipelineOptions(pipeline_args)
@@ -57,18 +68,19 @@ def run(argv=None, save_main_session=True):
 
      | 'Read from a File' >> beam.io.ReadFromText(known_args.input)
      | 'Load JSON' >> beam.Map(json.loads)
-     | 'Custom Parse' >> beam.ParDo(custom_json_parser())
+     | 'Custom Parse' >> beam.ParDo(DataIngestion())
      | 'Write to BigQuery' >> beam.io.Write(
                 beam.io.WriteToBigQuery(
                     known_args.output,
                     schema=g_schema,
                     create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED,
                     # Deletes all data in the BigQuery table before writing.
-                    write_disposition=beam.io.BigQueryDisposition.WRITE_APPEND)))
+                    write_disposition=beam.io.BigQueryDisposition.WRITE_TRUNCATE)))
 
     p.run().wait_until_finish()
+    write_metadata(dc=datacatalog_v1.DataCatalogClient(), metadata=metadata, table_id=known_args.output.split('.')[-1])
 
 
 if __name__ == '__main__':
     logging.getLogger().setLevel(logging.INFO)
-    run()
+    run(sys.argv)
